@@ -1,0 +1,105 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build eif-builder image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: false
+          load: true
+          tags: eif-builder:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build EIF image
+        run: |
+          docker run \
+            --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock \
+            -v $(pwd):/output \
+            -e DOCKER_IMAGE=hello-world:latest \
+            -e EIF_FILE=enclave.eif \
+            -e INFO_FILE=enclave-info.json \
+            eif-builder:latest
+
+      - name: Setup oras
+        uses: oras-project/setup-oras@v1
+
+      - name: Log into ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push to ghcr.io
+        id: push
+        shell: bash
+        env:
+          TAG: ${{ github.sha }}
+        run: |
+          oras push \
+            --export-manifest manifest.json \
+            --annotation "PCR0=$(jq -r ".Measurements.PCR0" enclave-info.json)" \
+            --annotation "PCR1=$(jq -r ".Measurements.PCR1" enclave-info.json)" \
+            --annotation "PCR2=$(jq -r ".Measurements.PCR2" enclave-info.json)" \
+            "ghcr.io/${{ github.repository }}:latest" \
+            enclave.eif \
+            enclave-info.json \
+            2>&1 | tee push.log
+
+          echo "digest=$(grep ^Digest push.log | cut -d " " -f 2)" >> "${GITHUB_OUTPUT}"
+          cat "${GITHUB_OUTPUT}"
+
+      - name: Attest
+        uses: actions/attest-build-provenance@v1
+        id: attest
+        with:
+          subject-name: ghcr.io/${{ github.repository }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
+
+      - name: Generate release notes
+        id: generate-release-notes
+        run: |
+          RELEASE_NOTES=$(cat << EOF
+          Measurements:
+          \`\`\`
+          PCR0 $(jq -r ".Measurements.PCR0" enclave-info.json)
+          PCR1 $(jq -r ".Measurements.PCR1" enclave-info.json)
+          PCR2 $(jq -r ".Measurements.PCR2" enclave-info.json)
+          \`\`\`
+          Log: https://search.sigstore.dev?logIndex=$(jq -r ".verificationMaterial.tlogEntries[0].logIndex" ${{ steps.attest.outputs.bundle-path }})
+          EOF
+          )
+          echo "release-notes<<EOF" >> "$GITHUB_OUTPUT"
+          echo "${RELEASE_NOTES}" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            enclave.eif
+            enclave-info.json
+          body: ${{ steps.generate-release-notes.outputs.release-notes }}

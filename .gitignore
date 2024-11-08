@@ -1,0 +1,5 @@
+.idea/
+*.eif
+*.tar
+*-info.json
+.secrets
